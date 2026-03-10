@@ -1,0 +1,39 @@
+name: LMS Sync Scraper
+
+on:
+  workflow_dispatch:
+    inputs:
+      studentId:
+        description: 'Student ID to scrape'
+        required: true
+      sheetRow:
+        description: 'Row number in Google Sheets'
+        required: true
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Run Scraper
+        env:
+          STUDENT_ID: ${{ github.event.inputs.studentId }}
+          SHEET_ROW: ${{ github.event.inputs.sheetRow }}
+          LMS_USER: ${{ secrets.LMS_USER }}
+          LMS_PASS: ${{ secrets.LMS_PASS }}
+          GCP_CREDS_JSON: ${{ secrets.GCP_CREDS_JSON }}
+        run: python scraper.py
