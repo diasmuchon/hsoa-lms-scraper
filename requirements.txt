@@ -1,3 +1,4 @@
-playwright==1.42.0
-gspread==6.0.0
-oauth2client==4.1.3
+selenium>=4.15.0
+webdriver-manager>=4.0.0
+google-auth>=2.23.0
+google-api-python-client>=2.108.0
