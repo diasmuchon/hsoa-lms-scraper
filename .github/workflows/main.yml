@@ -1,1 +1,51 @@
+name: HSOA LMS Gradebook Checker
 
+on:
+  schedule:
+    # Run every day at 6 AM and 6 PM Oman time (GMT+4)
+    - cron: '0 2,14 * * *'  # 2 AM and 2 PM UTC = 6 AM and 6 PM Oman time
+  workflow_dispatch:
+    inputs:
+      manual_run:
+        description: 'Manual gradebook check'
+        required: false
+        default: 'false'
+
+jobs:
+  check-grades:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Run Gradebook Checker
+      env:
+        HSOA_USERNAME: ${{ secrets.HSOA_USERNAME }}
+        HSOA_PASSWORD: ${{ secrets.HSOA_PASSWORD }}
+        GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        GOOGLE_SPREADSHEET_ID: ${{ secrets.GOOGLE_SPREADSHEET_ID }}
+      run: |
+        python gradebook_checker.py
+    
+    - name: Notify on failure
+      if: failure()
+      uses: actions/github-script@v6
+      with:
+        script: |
+          github.rest.issues.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title: 'Gradebook Checker Failed',
+            body: 'The automated gradebook checker failed. Please check the workflow logs.'
+          })
