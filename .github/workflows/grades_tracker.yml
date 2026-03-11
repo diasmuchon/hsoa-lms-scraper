@@ -3,7 +3,7 @@ name: Grades Progress Tracker
 on:
   schedule:
     - cron: '0 8 * * 1'  # Run every Monday at 8 AM
-  workflow_dispatch:
+  workflow_dispatch:    # Allow manual triggering without inputs
 
 jobs:
   track-grades:
