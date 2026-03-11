@@ -1,88 +1,44 @@
-# HSOA Gradebook Checker
+# HSOA LMS Gradebook Checker
 
-Automatically scrape gradebook data from HSOA LMS and upload to Google Sheets.
+Automatically checks grades for students from HSOA LMS and updates Google Sheets.
 
-## Features
+## Setup
 
-- ✅ Logs into HSOA LMS automatically
-- ✅ Navigates to User Management and searches for students
-- ✅ Opens student profiles and extracts gradebook data
-- ✅ Uploads to Google Sheets in specified format
-- ✅ Runs on GitHub Actions (headless)
-- ✅ Can be triggered from Google Sheets menu
+### 1. Google Sheets Preparation
 
-## Setup Instructions
+Create a sheet named "STUDENTS" with student IDs in column A starting from row 2:
 
-### 1. GitHub Repository Setup
+| A | B | C |
+|---|---|---|
+| Student ID | | |
+| 2023379315 | | |
+| 2023379316 | | |
+| ... | | |
 
-1. Fork this repository or create a new one
-2. Add the following files:
-   - `gradebook_checker.py`
-   - `requirements.txt`
-   - `.github/workflows/gradebook_checker.yml`
-   - `README.md`
+### 2. GitHub Secrets
 
-### 2. GitHub Secrets Configuration
+Set these secrets in your repository:
 
-Go to your repository Settings → Secrets and variables → Actions → New repository secret:
+- `HSOA_USERNAME`: Your HSOA LMS username
+- `HSOA_PASSWORD`: Your HSOA LMS password  
+- `GOOGLE_CREDENTIALS_JSON`: Your Google service account JSON
+- `GOOGLE_SPREADSHEET_ID`: Your Google Sheet ID
 
-Add these secrets:
-- `HSOA_USERNAME`: Your HSOA login username
-- `HSOA_PASSWORD`: Your HSOA login password
-- `GOOGLE_CREDENTIALS_JSON`: Google Service Account JSON (see below)
-- `GOOGLE_SPREADSHEET_ID`: Your Google Sheets ID (from URL)
-- `STUDENT_IDS`: (Optional) Default student IDs to check
-- `GITHUB_TOKEN`: (Optional) For Apps Script integration
-
-### 3. Google Service Account Setup
+### 3. Service Account Setup
 
 1. Go to [Google Cloud Console](https://console.cloud.google.com/)
-2. Create a new project or select existing
-3. Enable Google Sheets API
-4. Create Service Account:
-   - IAM & Admin → Service Accounts → Create Service Account
-   - Grant "Editor" role
-   - Create key → JSON → Download
-5. Add Service Account to your Google Sheet:
-   - Open your Google Sheet
-   - Share → Add the service account email as Editor
+2. Create a service account
+3. Download JSON credentials
+4. Share your Google Sheet with the service account email
 
-### 4. Google Apps Script Setup
+## How It Works
 
-1. Open your Google Sheet
-2. Extensions → Apps Script
-3. Paste the `google_apps_script.gs` code
-4. Update configuration:
-   - `GITHUB_TOKEN`: Your GitHub Personal Access Token
-   - `GITHUB_REPO`: Your GitHub username/repository
-5. Save and reload the Google Sheet
-6. You should see "HSOA Tools" in the menu
+1. Reads student IDs from "STUDENTS" sheet column A2:A
+2. Logs into HSOA LMS
+3. Fetches grades for each student
+4. Updates "GRADES" sheet with new records
+5. Runs automatically twice daily (6 AM/6 PM Oman time)
 
-## Usage
+## Manual Run
 
-### From Google Sheets
-1. Open your Google Sheet
-2. Click "HSOA Tools" in the menu
-3. Select "Check Gradebook" or "Select Students to Check"
-4. Results will appear in the "GRADES_PROGRESS" sheet
-
-### From GitHub Actions
-1. Go to your repository → Actions
-2. Select "HSOA Gradebook Checker"
-3. Click "Run workflow"
-4. Enter student IDs (optional)
-5. Click "Run workflow"
-
-### From Command Line
-```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Run with environment variables
-export HSOA_USERNAME="your_username"
-export HSOA_PASSWORD="your_password"
-export GOOGLE_CREDENTIALS_JSON='{"your": "json"}'
-export GOOGLE_SPREADSHEET_ID="your_spreadsheet_id"
-export STUDENT_IDS="2023379315,2023379316"
-
-python gradebook_checker.py --upload-sheets
+You can manually trigger the workflow from GitHub Actions tab.
