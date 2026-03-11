@@ -57,7 +57,7 @@ class Config:
     login_url: str = "https://hsoa.ordolms.com/"
     user_management_url: str = "https://hsoa.ordolms.com/home/userManagement"
     headless_mode: bool = True
-    max_workers: int = 1
+    max_workers: int = 1  # Default to 1 worker to avoid ChromeDriver issues
     page_load_timeout_seconds: int = 15
     implicit_wait_seconds: int = 3
     short_wait_seconds: int = 5
@@ -211,6 +211,7 @@ def setup_chrome_driver(cfg: Config, worker_id: int = 0):
     chrome_options.add_argument("--disable-features=VizDisplayCompositor")
 
     try:
+        # Try to get the ChromeDriver manager to work
         service = Service(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=chrome_options)
         driver.set_page_load_timeout(cfg.page_load_timeout_seconds)
@@ -218,7 +219,15 @@ def setup_chrome_driver(cfg: Config, worker_id: int = 0):
         return driver
     except Exception as e:
         log.error("Error setting up ChromeDriver (worker %d): %s", worker_id, e)
-        return None
+        # Try alternative approach
+        try:
+            driver = webdriver.Chrome(options=chrome_options)
+            driver.set_page_load_timeout(cfg.page_load_timeout_seconds)
+            driver.implicitly_wait(cfg.implicit_wait_seconds)
+            return driver
+        except Exception as e2:
+            log.error("Alternative ChromeDriver setup also failed (worker %d): %s", worker_id, e2)
+            return None
 
 # ============================================================
 # SELENIUM ACTIONS
@@ -465,6 +474,14 @@ def worker_process_students(
     driver = setup_chrome_driver(cfg, worker_id)
     if not driver:
         log.error("[Worker %d] Failed to start browser.", worker_id)
+        # Put failures in queue so main thread knows about them
+        for student in students:
+            results_queue.put({
+                "student_id": student["id"],
+                "student_name": student["full_name"],
+                "courses": [],
+                "success": False,
+            })
         return
     
     try:
@@ -487,14 +504,29 @@ def worker_process_students(
             result["student_id"] = student_id  # Ensure correct ID is used
             
             results_queue.put(result)
-            log.info(
-                "[Worker %d] Done: %s - Found %d courses",
-                worker_id,
-                full_name,
-                len(result["courses"]),
-            )
+            if result["success"]:
+                log.info(
+                    "[Worker %d] Done: %s - Found %d courses",
+                    worker_id,
+                    full_name,
+                    len(result["courses"]),
+                )
+            else:
+                log.warning(
+                    "[Worker %d] Failed: %s",
+                    worker_id,
+                    full_name,
+                )
     except Exception as e:
         log.error("[Worker %d] Error: %s", worker_id, e)
+        # Mark remaining students as failed
+        for student in students:
+            results_queue.put({
+                "student_id": student["id"],
+                "student_name": student["full_name"],
+                "courses": [],
+                "success": False,
+            })
     finally:
         driver.quit()
         log.info("[Worker %d] Finished.", worker_id)
@@ -509,7 +541,7 @@ def parse_args():
     parser.add_argument(
         "--workers",
         type=int,
-        default=1,
+        default=1,  # Changed default to 1
         help="Number of parallel browser workers (default: 1).",
     )
     return parser.parse_args()
@@ -558,6 +590,12 @@ def main():
 
     results_queue: Queue = Queue()
     num_workers = min(cfg.max_workers, len(students))
+    
+    # If we only have one worker or failed to start ChromeDriver multiple times,
+    # it's better to use just one worker
+    if num_workers > 1:
+        log.info("Note: Using multiple workers may cause ChromeDriver issues. Consider using --workers 1")
+    
     chunks = distribute(students, num_workers)
 
     threads = []
@@ -588,8 +626,10 @@ def main():
         log.warning("GOOGLE_SPREADSHEET_ID not set; skipping Google Sheets upload.")
 
     success_count = sum(1 for r in all_results if r["success"])
+    failure_count = len(all_results) - success_count
     log.info(
-        "Done. %d/%d students processed successfully.", success_count, len(students)
+        "Done. %d/%d students processed successfully. %d failed.",
+        success_count, len(students), failure_count
     )
 
 if __name__ == "__main__":
