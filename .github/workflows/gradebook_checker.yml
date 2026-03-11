@@ -1,21 +1,25 @@
-
 name: HSOA Gradebook Checker
 
 on:
   workflow_dispatch:
     inputs:
       student_ids:
-        description: 'Comma-separated student IDs (optional, can use env var)'
-        required: false
+        description: 'Comma-separated student IDs'
+        required: true
         default: ''
+      output_name:
+        description: 'Output CSV filename'
+        required: false
+        default: 'gradebook_report'
       upload_sheets:
         description: 'Upload to Google Sheets'
         type: boolean
         default: true
-      no_headless:
-        description: 'Run in visible mode (for debugging)'
-        type: boolean
-        default: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
 
 jobs:
   check-gradebook:
@@ -25,10 +29,19 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
     
-    - name: Set up Python
+    - name: Setup Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.10'
+    
+    - name: Install Chrome
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y wget
+        wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+        echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
+        sudo apt-get update
+        sudo apt-get install -y google-chrome-stable
     
     - name: Install dependencies
       run: |
@@ -41,24 +54,52 @@ jobs:
         HSOA_PASSWORD: ${{ secrets.HSOA_PASSWORD }}
         GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
         GOOGLE_SPREADSHEET_ID: ${{ secrets.GOOGLE_SPREADSHEET_ID }}
-        STUDENT_IDS: ${{ github.event.inputs.student_ids || secrets.STUDENT_IDS }}
+        GOOGLE_SHEET_NAME: ${{ secrets.GOOGLE_SHEET_NAME || 'GRADES_PROGRESS' }}
       run: |
-        python gradebook_checker.py \
-          --students "${{ github.event.inputs.student_ids || '' }}" \
-          --output "gradebook_report_$(date +%Y%m%d_%H%M%S).csv" \
-          ${{ github.event.inputs.upload_sheets && '--upload-sheets' || '' }} \
-          ${{ github.event.inputs.no_headless && '--no-headless' || '' }}
+        # Create output filename with timestamp
+        OUTPUT_FILE="${GITHUB_WORKSPACE}/${{ github.event.inputs.output_name || 'gradebook_report' }}_$(date +%Y%m%d_%H%M%S).csv"
+        
+        # Build command
+        CMD="python gradebook_checker.py"
+        
+        # Add student IDs if provided
+        if [ -n "${{ github.event.inputs.student_ids }}" ]; then
+          CMD="$CMD --students \"${{ github.event.inputs.student_ids }}\""
+        fi
+        
+        # Add output file
+        CMD="$CMD --output \"$OUTPUT_FILE\""
+        
+        # Add upload sheets flag if true
+        if [ "${{ github.event.inputs.upload_sheets }}" == "true" ]; then
+          CMD="$CMD --upload-sheets"
+        fi
+        
+        # Run the command
+        echo "Running: $CMD"
+        eval $CMD
+        
+        # Save output file path for next step
+        echo "OUTPUT_FILE=$OUTPUT_FILE" >> $GITHUB_ENV
     
     - name: Upload CSV artifact
       uses: actions/upload-artifact@v4
-      if: always()
       with:
-        name: gradebook-reports
-        path: "gradebook_report_*.csv"
+        name: gradebook-report
+        path: ${{ env.OUTPUT_FILE }}
     
-    - name: Upload logs
-      uses: actions/upload-artifact@v4
+    - name: Upload debug info on failure
       if: failure()
+      uses: actions/upload-artifact@v4
       with:
-        name: debug-screenshots
-        path: "*.png"
+        name: debug-info
+        path: |
+          *.png
+          *.log
+          debug/
+    
+    - name: Notify completion
+      if: success()
+      run: |
+        echo "✅ Gradebook check completed successfully!"
+        echo "📁 Output file: ${{ env.OUTPUT_FILE }}"
