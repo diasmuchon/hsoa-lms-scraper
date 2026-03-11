@@ -3,7 +3,7 @@ name: Grades Progress Tracker
 on:
   schedule:
     - cron: '0 8 * * 1'  # Run every Monday at 8 AM
-  workflow_dispatch:    # Allow manual triggering without inputs
+  workflow_dispatch:    # Allow manual triggering
 
 jobs:
   track-grades:
@@ -29,4 +29,4 @@ jobs:
         GOOGLE_SHEET_NAME: GRADES_PROGRESS
         STUDENTS_SHEET_NAME: STUDENTS
       run: |
-        python grades_tracker.py --workers 3
+        python grades_tracker.py --workers 1  # Force single worker
