@@ -1,220 +1,573 @@
 #!/usr/bin/env python3
+"""
+Grades Progress Tracker for HS Online Academy.
+Extracts student grade information and uploads to Google Sheets.
+
+Environment Variables Required:
+  HSOA_USERNAME            - Login username
+  HSOA_PASSWORD            - Login password
+  GOOGLE_CREDENTIALS_JSON  - Google service account JSON (as string)
+  GOOGLE_SPREADSHEET_ID    - Google Sheets spreadsheet ID
+"""
+
+import argparse
+import json
+import logging
 import os
 import sys
 import time
+from dataclasses import dataclass
+from queue import Queue
+from threading import Thread
+
 from selenium import webdriver
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.options import Options
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
 from webdriver_manager.chrome import ChromeDriverManager
-from selenium.webdriver.chrome.service import Service
-import gspread
-from google.oauth2.service_account import Credentials
-import pandas as pd
 
-# Google Sheets setup
-SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-SPREADSHEET_ID = os.environ['GOOGLE_SPREADSHEET_ID']
+try:
+    from google.oauth2.service_account import Credentials
+    from googleapiclient.discovery import build
+    GOOGLE_SHEETS_AVAILABLE = True
+except ImportError:
+    GOOGLE_SHEETS_AVAILABLE = False
 
-def get_student_ids_from_sheet():
-    """Get student IDs from STUDENTS sheet column A2:A"""
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+@dataclass
+class Config:
+    username: str = ""
+    password: str = ""
+    google_credentials_json: str = ""
+    google_spreadsheet_id: str = ""
+    google_sheet_name: str = "GRADES_PROGRESS"
+    students_sheet_name: str = "STUDENTS"
+    login_url: str = "https://hsoa.ordolms.com/"
+    user_management_url: str = "https://hsoa.ordolms.com/home/userManagement"
+    headless_mode: bool = True
+    max_workers: int = 1
+    page_load_timeout_seconds: int = 15
+    implicit_wait_seconds: int = 3
+    short_wait_seconds: int = 5
+
+# ============================================================
+# GOOGLE SHEETS
+# ============================================================
+def get_google_sheets_service(cfg: Config):
+    if not GOOGLE_SHEETS_AVAILABLE:
+        log.warning("Google Sheets libraries not installed.")
+        return None
+    if not cfg.google_credentials_json:
+        log.warning("GOOGLE_CREDENTIALS_JSON environment variable not set.")
+        return None
     try:
-        # Authenticate with Google Sheets
-        credentials = Credentials.from_service_account_info(
-            eval(os.environ['GOOGLE_CREDENTIALS_JSON']), 
-            scopes=SCOPES
-        )
-        gc = gspread.authorize(credentials)
-        
-        # Open the spreadsheet and worksheet
-        spreadsheet = gc.open_by_key(SPREADSHEET_ID)
-        students_sheet = spreadsheet.worksheet('STUDENTS')
-        
-        # Get all values from column A starting from row 2
-        student_ids = students_sheet.col_values(1)[1:]  # Skip header row
-        
-        # Filter out empty strings and None values
-        student_ids = [str(sid).strip() for sid in student_ids if str(sid).strip()]
-        
-        print(f"Retrieved {len(student_ids)} student IDs from sheet: {student_ids}")
-        return student_ids
-        
+        info = json.loads(cfg.google_credentials_json)
+        SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+        credentials = Credentials.from_service_account_info(info, scopes=SCOPES)
+        service = build("sheets", "v4", credentials=credentials)
+        return service
     except Exception as e:
-        print(f"Error reading student IDs from sheet: {e}")
+        log.warning("Error connecting to Google Sheets: %s", e)
+        return None
+
+def fetch_student_ids_from_sheet(cfg: Config) -> list:
+    service = get_google_sheets_service(cfg)
+    if not service:
+        log.error("Could not connect to Google Sheets to fetch student IDs.")
+        return []
+    
+    try:
+        # Read student IDs from column A starting from row 2
+        range_name = f"{cfg.students_sheet_name}!A2:A"
+        sheet = service.spreadsheets()
+        result = sheet.values().get(
+            spreadsheetId=cfg.google_spreadsheet_id,
+            range=range_name
+        ).execute()
+        
+        values = result.get('values', [])
+        student_ids = []
+        
+        for row in values:
+            if row and row[0].strip():  # Skip empty rows
+                student_ids.append(row[0].strip())
+                
+        log.info("Fetched %d student IDs from Google Sheets", len(student_ids))
+        return student_ids
+    except Exception as e:
+        log.error("Error fetching student IDs from Google Sheets: %s", e)
         return []
 
-def setup_driver():
-    """Setup Chrome driver with options"""
-    chrome_options = Options()
-    chrome_options.add_argument('--headless')
-    chrome_options.add_argument('--no-sandbox')
-    chrome_options.add_argument('--disable-dev-shm-usage')
-    chrome_options.add_argument('--disable-gpu')
-    chrome_options.add_argument('--window-size=1920,1080')
-    
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=chrome_options)
-    return driver
-
-def login_to_hsoa(driver, username, password):
-    """Login to HSOA LMS"""
+def upload_to_google_sheets(cfg: Config, results: list) -> bool:
+    service = get_google_sheets_service(cfg)
+    if not service:
+        log.warning("Could not connect to Google Sheets.")
+        return False
     try:
-        driver.get("https://lms.hsoa.edu.om/login/index.php")
+        # Prepare header
+        header = ["Student ID", "Student Name", "Course Code", "Course Name", "Assigned Grade", "Status", "Percentage"]
+        rows = [header]
         
-        # Wait for and fill login form
-        username_field = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.ID, "username"))
-        )
-        password_field = driver.find_element(By.ID, "password")
-        login_button = driver.find_element(By.ID, "loginbtn")
+        # Process each student's data
+        for result in results:
+            student_id = result["student_id"]
+            student_name = result["student_name"]
+            
+            if result["courses"]:
+                for course in result["courses"]:
+                    rows.append([
+                        student_id,
+                        student_name,
+                        course["code"],
+                        course["name"],
+                        course["assigned_grade"],
+                        course["status"],
+                        course["percentage"]
+                    ])
+            else:
+                # Add a row even if no courses found
+                rows.append([student_id, student_name, "No courses found", "", "", "", ""])
         
-        username_field.send_keys(username)
-        password_field.send_keys(password)
-        login_button.click()
+        # Clear existing data in the sheet
+        spreadsheet_id = cfg.google_spreadsheet_id
+        service.spreadsheets().values().clear(
+            spreadsheetId=spreadsheet_id,
+            range=f"{cfg.google_sheet_name}!A:G",
+        ).execute()
         
-        # Wait for login to complete
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.CLASS_NAME, "usermenu"))
-        )
-        print("Login successful")
+        # Upload new data
+        service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=f"{cfg.google_sheet_name}!A1",
+            valueInputOption="RAW",
+            body={"values": rows},
+        ).execute()
+        
+        log.info("Uploaded %d records to Google Sheets.", len(rows) - 1)
         return True
-        
     except Exception as e:
-        print(f"Login failed: {e}")
+        log.warning("Error uploading to Google Sheets: %s", e)
         return False
 
-def get_student_grades(driver, student_id):
-    """Get grades for a specific student"""
+# ============================================================
+# SELENIUM HELPERS
+# ============================================================
+def js_click(driver: webdriver.Chrome, element):
+    driver.execute_script("arguments[0].click();", element)
+
+def safe_click(driver: webdriver.Chrome, element):
     try:
-        # Navigate to gradebook
-        driver.get(f"https://lms.hsoa.edu.om/grade/report/overview/index.php?id={student_id}")
-        
-        # Wait for grades to load
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.TAG_NAME, "table"))
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});")
+        time.sleep(0.2)
+    except Exception:
+        pass
+    try:
+        element.click()
+    except Exception:
+        js_click(driver, element)
+
+# ============================================================
+# CHROMEDRIVER SETUP
+# ============================================================
+def setup_chrome_driver(cfg: Config, worker_id: int = 0):
+    chrome_options = Options()
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--disable-extensions")
+    chrome_options.add_argument("--disable-notifications")
+    chrome_options.add_argument("--disable-popup-blocking")
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_argument("--window-size=1920,1080")
+    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    chrome_options.add_experimental_option("useAutomationExtension", False)
+    if cfg.headless_mode:
+        chrome_options.add_argument("--headless=new")
+    chrome_options.add_argument("--disable-features=VizDisplayCompositor")
+
+    try:
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        driver.set_page_load_timeout(cfg.page_load_timeout_seconds)
+        driver.implicitly_wait(cfg.implicit_wait_seconds)
+        return driver
+    except Exception as e:
+        log.error("Error setting up ChromeDriver (worker %d): %s", worker_id, e)
+        return None
+
+# ============================================================
+# SELENIUM ACTIONS
+# ============================================================
+def login_to_hsoa(driver: webdriver.Chrome, cfg: Config) -> bool:
+    try:
+        driver.get(cfg.login_url)
+        time.sleep(2)
+        if "home" in driver.current_url or "dashboard" in driver.current_url:
+            return True
+        username_field = WebDriverWait(driver, cfg.short_wait_seconds).until(
+            EC.presence_of_element_located((By.NAME, "username"))
         )
+        username_field.clear()
+        username_field.send_keys(cfg.username)
+        password_field = driver.find_element(By.NAME, "password")
+        password_field.clear()
+        password_field.send_keys(cfg.password)
+        submit_button = driver.find_element(By.CSS_SELECTOR, 'button[type="submit"]')
+        safe_click(driver, submit_button)
+        time.sleep(3)
+        return "login" not in driver.current_url.lower()
+    except Exception as e:
+        log.error("Login error: %s", e)
+        return False
+
+def navigate_to_user_management(driver: webdriver.Chrome, cfg: Config) -> bool:
+    try:
+        # Click on User Management link in sidebar
+        user_management_link = WebDriverWait(driver, cfg.short_wait_seconds).until(
+            EC.element_to_be_clickable((By.XPATH, '//span[contains(text(), "User Management")]'))
+        )
+        safe_click(driver, user_management_link)
+        time.sleep(2)
+        return True
+    except Exception as e:
+        log.error("Navigation to User Management error: %s", e)
+        return False
+
+def search_for_student(driver: webdriver.Chrome, student_id: str, cfg: Config) -> bool:
+    try:
+        # Find and fill the search input
+        search_input = WebDriverWait(driver, cfg.short_wait_seconds).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, 'input[data-placeholder*="Pedro"]'))
+        )
+        search_input.clear()
+        search_input.send_keys(student_id)
+        time.sleep(1)
+        return True
+    except Exception as e:
+        log.error("Search for student error: %s", e)
+        return False
+
+def open_student_profile(driver: webdriver.Chrome, cfg: Config) -> bool:
+    try:
+        # Click on the settings icon to open student profile
+        settings_icon = WebDriverWait(driver, cfg.short_wait_seconds).until(
+            EC.element_to_be_clickable((By.XPATH, '//mat-icon[contains(text(), "settings")]'))
+        )
+        safe_click(driver, settings_icon)
+        time.sleep(2)
+        return True
+    except Exception as e:
+        log.error("Open student profile error: %s", e)
+        return False
+
+def switch_to_new_window(driver: webdriver.Chrome) -> bool:
+    try:
+        # Switch to the newly opened window/tab
+        main_window = driver.current_window_handle
+        new_window = next(
+            (w for w in driver.window_handles if w != main_window), None
+        )
+        if not new_window:
+            return False
         
-        # Extract grade data
-        tables = driver.find_elements(By.TAG_NAME, "table")
-        grades_data = []
+        driver.switch_to.window(new_window)
+        time.sleep(1)
+        return True
+    except Exception as e:
+        log.error("Switch to new window error: %s", e)
+        return False
+
+def navigate_to_gradebook(driver: webdriver.Chrome, cfg: Config) -> bool:
+    try:
+        # Click on the Gradebook tab
+        gradebook_tab = WebDriverWait(driver, cfg.short_wait_seconds).until(
+            EC.element_to_be_clickable((By.XPATH, '//div[contains(text(), "Gradebook")]'))
+        )
+        safe_click(driver, gradebook_tab)
+        time.sleep(2)
+        return True
+    except Exception as e:
+        log.error("Navigate to Gradebook error: %s", e)
+        return False
+
+def change_items_per_page(driver: webdriver.Chrome, cfg: Config) -> bool:
+    try:
+        # Change items per page to show all courses
+        items_selector = WebDriverWait(driver, cfg.short_wait_seconds).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, 'mat-select[aria-label*="Items per page"]'))
+        )
+        safe_click(driver, items_selector)
+        time.sleep(0.5)
         
-        for table in tables:
+        # Select "30" items per page
+        options = driver.find_elements(By.CSS_SELECTOR, "mat-option")
+        for option in options:
+            text = option.text.strip()
+            if text == "30":
+                safe_click(driver, option)
+                time.sleep(1)
+                return True
+        
+        return False
+    except Exception as e:
+        log.error("Change items per page error: %s", e)
+        return False
+
+def extract_student_name(driver: webdriver.Chrome) -> str:
+    try:
+        # Extract student name from the profile page
+        name_element = WebDriverWait(driver, 5).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, '.student-name, h1, .profile-header'))
+        )
+        return name_element.text.strip()
+    except Exception:
+        return "Unknown Student"
+
+def extract_course_data(driver: webdriver.Chrome, cfg: Config) -> list:
+    courses = []
+    try:
+        # Wait for course table to load
+        WebDriverWait(driver, cfg.short_wait_seconds).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "tbody tr"))
+        )
+        time.sleep(1)
+        
+        # Find all course rows
+        rows = driver.find_elements(By.CSS_SELECTOR, "tbody tr")
+        
+        for row in rows:
             try:
-                rows = table.find_elements(By.TAG_NAME, "tr")
-                for row in rows[1:]:  # Skip header row
-                    cols = row.find_elements(By.TAG_NAME, "td")
-                    if len(cols) >= 2:
-                        course = cols[0].text.strip()
-                        grade = cols[1].text.strip()
-                        if course and grade:
-                            grades_data.append({
-                                'student_id': student_id,
-                                'course': course,
-                                'grade': grade,
-                                'timestamp': pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
-                            })
-            except:
+                cells = row.find_elements(By.TAG_NAME, "td")
+                if len(cells) >= 7:  # Ensure we have enough columns
+                    course_code = cells[0].text.strip()
+                    course_name = cells[1].text.strip()
+                    assigned_grade = cells[2].text.strip()
+                    status = cells[4].text.strip()
+                    percentage = cells[6].text.strip()
+                    
+                    # Only include courses with data
+                    if course_code or course_name:
+                        courses.append({
+                            "code": course_code,
+                            "name": course_name,
+                            "assigned_grade": assigned_grade,
+                            "status": status,
+                            "percentage": percentage
+                        })
+            except Exception as e:
+                log.warning("Error extracting course data from row: %s", e)
                 continue
-        
-        return grades_data
-        
+                
+        return courses
     except Exception as e:
-        print(f"Error getting grades for student {student_id}: {e}")
-        return []
+        log.error("Error extracting course data: %s", e)
+        return courses
 
-def update_google_sheet(grades_data):
-    """Update Google Sheet with new grades"""
+def process_student(
+    driver: webdriver.Chrome,
+    student_id: str,
+    cfg: Config,
+) -> dict:
+    result = {
+        "student_id": student_id,
+        "student_name": "",
+        "courses": [],
+        "success": False,
+    }
+    
     try:
-        credentials = Credentials.from_service_account_info(
-            eval(os.environ['GOOGLE_CREDENTIALS_JSON']), 
-            scopes=SCOPES
-        )
-        gc = gspread.authorize(credentials)
-        spreadsheet = gc.open_by_key(SPREADSHEET_ID)
-        
-        # Use GRADES sheet or create if doesn't exist
-        try:
-            grades_sheet = spreadsheet.worksheet('GRADES')
-        except:
-            grades_sheet = spreadsheet.add_worksheet(title='GRADES', rows="1000", cols="10")
-            # Add headers
-            grades_sheet.append_row(['Student ID', 'Course', 'Grade', 'Timestamp'])
-        
-        # Clear old data but keep headers
-        if len(grades_data) > 0:
-            # Get existing data to avoid duplicates
-            existing_data = grades_sheet.get_all_records()
-            existing_records = set()
-            for record in existing_data:
-                existing_records.add((str(record.get('Student ID', '')), 
-                                   str(record.get('Course', '')), 
-                                   str(record.get('Grade', ''))))
+        # Navigate to user management
+        if not navigate_to_user_management(driver, cfg):
+            return result
             
-            # Add only new records
-            new_rows = []
-            for grade in grades_data:
-                record_key = (str(grade['student_id']), str(grade['course']), str(grade['grade']))
-                if record_key not in existing_records:
-                    new_rows.append([grade['student_id'], grade['course'], grade['grade'], grade['timestamp']])
+        # Search for student
+        if not search_for_student(driver, student_id, cfg):
+            return result
             
-            if new_rows:
-                grades_sheet.append_rows(new_rows)
-                print(f"Added {len(new_rows)} new grade records to sheet")
-            else:
-                print("No new grade records to add")
+        # Open student profile
+        if not open_student_profile(driver, cfg):
+            return result
+            
+        # Switch to new window
+        if not switch_to_new_window(driver):
+            return result
+            
+        # Get student name
+        result["student_name"] = extract_student_name(driver)
         
+        # Navigate to gradebook
+        if not navigate_to_gradebook(driver, cfg):
+            # Close window and return if gradebook navigation fails
+            driver.close()
+            driver.switch_to.window(driver.window_handles[0])
+            return result
+            
+        # Change items per page
+        change_items_per_page(driver, cfg)
+        
+        # Extract course data
+        result["courses"] = extract_course_data(driver, cfg)
+        result["success"] = True
+        
+        # Close the student profile window
+        driver.close()
+        driver.switch_to.window(driver.window_handles[0])
+        time.sleep(0.5)
+        
+        return result
     except Exception as e:
-        print(f"Error updating Google Sheet: {e}")
+        log.error("Error processing %s: %s", student_id, e)
+        try:
+            # Ensure we close any open windows
+            while len(driver.window_handles) > 1:
+                driver.switch_to.window(driver.window_handles[-1])
+                driver.close()
+            driver.switch_to.window(driver.window_handles[0])
+        except Exception:
+            pass
+        return result
 
-def main():
-    """Main function"""
-    print("Starting HSOA LMS Gradebook Checker...")
-    
-    # Get credentials from environment
-    username = os.environ['HSOA_USERNAME']
-    password = os.environ['HSOA_PASSWORD']
-    
-    # Get student IDs from Google Sheet
-    student_ids = get_student_ids_from_sheet()
-    
-    if not student_ids:
-        print("No student IDs found. Exiting.")
+# ============================================================
+# WORKER
+# ============================================================
+def worker_process_students(
+    worker_id: int,
+    student_ids: list,
+    cfg: Config,
+    results_queue: Queue,
+) -> None:
+    log.info("[Worker %d] Starting...", worker_id)
+    driver = setup_chrome_driver(cfg, worker_id)
+    if not driver:
+        log.error("[Worker %d] Failed to start browser.", worker_id)
         return
     
-    print(f"Processing {len(student_ids)} students")
-    
-    # Setup driver
-    driver = setup_driver()
-    all_grades = []
-    
     try:
-        # Login
-        if not login_to_hsoa(driver, username, password):
-            return
+        # Login to HS Online Academy
+        if not login_to_hsoa(driver, cfg):
+            log.warning("[Worker %d] Login may have failed, continuing...", worker_id)
         
-        # Get grades for each student
-        for i, student_id in enumerate(student_ids, 1):
-            print(f"Processing student {i}/{len(student_ids)}: {student_id}")
-            grades = get_student_grades(driver, student_id)
-            all_grades.extend(grades)
-            
-            # Small delay to avoid overloading the server
-            time.sleep(2)
-        
-        # Update Google Sheet
-        if all_grades:
-            update_google_sheet(all_grades)
-            print(f"Successfully processed {len(all_grades)} grade records")
-        else:
-            print("No grades were retrieved")
-            
+        # Process each student
+        for student_id in student_ids:
+            log.info("[Worker %d] Processing: %s", worker_id, student_id)
+            result = process_student(driver, student_id, cfg)
+            results_queue.put(result)
+            log.info(
+                "[Worker %d] Done: %s - Found %d courses",
+                worker_id,
+                student_id,
+                len(result["courses"]),
+            )
     except Exception as e:
-        print(f"Error during processing: {e}")
+        log.error("[Worker %d] Error: %s", worker_id, e)
     finally:
         driver.quit()
-        print("Gradebook checker completed")
+        log.info("[Worker %d] Finished.", worker_id)
+
+# ============================================================
+# CLI
+# ============================================================
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Extract student grades from HS Online Academy and upload to Google Sheets."
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of parallel browser workers (default: 1).",
+    )
+    return parser.parse_args()
+
+def build_config(args) -> Config:
+    username = os.environ.get("HSOA_USERNAME", "")
+    password = os.environ.get("HSOA_PASSWORD", "")
+    if not username or not password:
+        log.error(
+            "HSOA_USERNAME and HSOA_PASSWORD environment variables must be set."
+        )
+        sys.exit(1)
+
+    return Config(
+        username=username,
+        password=password,
+        google_credentials_json=os.environ.get("GOOGLE_CREDENTIALS_JSON", ""),
+        google_spreadsheet_id=os.environ.get("GOOGLE_SPREADSHEET_ID", ""),
+        google_sheet_name=os.environ.get("GOOGLE_SHEET_NAME", "GRADES_PROGRESS"),
+        students_sheet_name=os.environ.get("STUDENTS_SHEET_NAME", "STUDENTS"),
+        max_workers=args.workers,
+    )
+
+def distribute(items: list, n: int) -> list:
+    """Split items into n roughly equal chunks."""
+    chunks = [[] for _ in range(n)]
+    for i, item in enumerate(items):
+        chunks[i % n].append(item)
+    return chunks
+
+def main():
+    args = parse_args()
+    cfg = build_config(args)
+    
+    # Fetch student IDs from Google Sheets
+    student_ids = fetch_student_ids_from_sheet(cfg)
+    if not student_ids:
+        log.error("No student IDs found in Google Sheets.")
+        sys.exit(1)
+
+    log.info(
+        "Processing %d student(s) with %d worker(s).",
+        len(student_ids),
+        cfg.max_workers,
+    )
+
+    results_queue: Queue = Queue()
+    num_workers = min(cfg.max_workers, len(student_ids))
+    chunks = distribute(student_ids, num_workers)
+
+    threads = []
+    for worker_id, chunk in enumerate(chunks):
+        t = Thread(
+            target=worker_process_students,
+            args=(worker_id, chunk, cfg, results_queue),
+        )
+        t.start()
+        threads.append(t)
+
+    for t in threads:
+        t.join()
+
+    all_results = []
+    while not results_queue.empty():
+        result = results_queue.get()
+        all_results.append(result)
+
+    log.info("Processing complete. Uploading to Google Sheets...")
+    
+    if cfg.google_spreadsheet_id:
+        if upload_to_google_sheets(cfg, all_results):
+            log.info("Successfully uploaded data to Google Sheets.")
+        else:
+            log.error("Failed to upload data to Google Sheets.")
+    else:
+        log.warning("GOOGLE_SPREADSHEET_ID not set; skipping Google Sheets upload.")
+
+    success_count = sum(1 for r in all_results if r["success"])
+    log.info(
+        "Done. %d/%d students processed successfully.", success_count, len(student_ids)
+    )
 
 if __name__ == "__main__":
     main()
