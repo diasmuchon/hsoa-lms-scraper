@@ -82,15 +82,15 @@ def get_google_sheets_service(cfg: Config):
         log.warning("Error connecting to Google Sheets: %s", e)
         return None
 
-def fetch_student_ids_from_sheet(cfg: Config) -> list:
+def fetch_active_students_from_sheet(cfg: Config) -> list:
     service = get_google_sheets_service(cfg)
     if not service:
-        log.error("Could not connect to Google Sheets to fetch student IDs.")
+        log.error("Could not connect to Google Sheets to fetch student data.")
         return []
     
     try:
-        # Read student IDs from column A starting from row 2
-        range_name = f"{cfg.students_sheet_name}!A2:A"
+        # Read student data from columns A, B, C, and E starting from row 2
+        range_name = f"{cfg.students_sheet_name}!A2:E"
         sheet = service.spreadsheets()
         result = sheet.values().get(
             spreadsheetId=cfg.google_spreadsheet_id,
@@ -98,16 +98,29 @@ def fetch_student_ids_from_sheet(cfg: Config) -> list:
         ).execute()
         
         values = result.get('values', [])
-        student_ids = []
+        students = []
         
         for row in values:
-            if row and row[0].strip():  # Skip empty rows
-                student_ids.append(row[0].strip())
+            # Ensure row has enough columns
+            if len(row) >= 5:
+                student_id = row[0].strip() if row[0] else ""
+                first_name = row[1].strip() if row[1] else ""
+                last_name = row[2].strip() if row[2] else ""
+                status = row[4].strip().lower() if row[4] else ""
                 
-        log.info("Fetched %d student IDs from Google Sheets", len(student_ids))
-        return student_ids
+                # Only include students marked as "active"
+                if student_id and status == "active":
+                    students.append({
+                        "id": student_id,
+                        "first_name": first_name,
+                        "last_name": last_name,
+                        "full_name": f"{first_name} {last_name}".strip()
+                    })
+                
+        log.info("Fetched %d active students from Google Sheets", len(students))
+        return students
     except Exception as e:
-        log.error("Error fetching student IDs from Google Sheets: %s", e)
+        log.error("Error fetching student data from Google Sheets: %s", e)
         return []
 
 def upload_to_google_sheets(cfg: Config, results: list) -> bool:
@@ -444,7 +457,7 @@ def process_student(
 # ============================================================
 def worker_process_students(
     worker_id: int,
-    student_ids: list,
+    students: list,  # Now a list of student dictionaries
     cfg: Config,
     results_queue: Queue,
 ) -> None:
@@ -460,14 +473,24 @@ def worker_process_students(
             log.warning("[Worker %d] Login may have failed, continuing...", worker_id)
         
         # Process each student
-        for student_id in student_ids:
-            log.info("[Worker %d] Processing: %s", worker_id, student_id)
+        for student in students:
+            student_id = student["id"]
+            full_name = student["full_name"]
+            
+            log.info("[Worker %d] Processing: %s (%s)", worker_id, full_name, student_id)
+            
+            # Process the student through the LMS
             result = process_student(driver, student_id, cfg)
+            
+            # Override the student name with the one from our sheet
+            result["student_name"] = full_name
+            result["student_id"] = student_id  # Ensure correct ID is used
+            
             results_queue.put(result)
             log.info(
                 "[Worker %d] Done: %s - Found %d courses",
                 worker_id,
-                student_id,
+                full_name,
                 len(result["courses"]),
             )
     except Exception as e:
@@ -521,21 +544,21 @@ def main():
     args = parse_args()
     cfg = build_config(args)
     
-    # Fetch student IDs from Google Sheets
-    student_ids = fetch_student_ids_from_sheet(cfg)
-    if not student_ids:
-        log.error("No student IDs found in Google Sheets.")
+    # Fetch active students from Google Sheets
+    students = fetch_active_students_from_sheet(cfg)
+    if not students:
+        log.error("No active students found in Google Sheets.")
         sys.exit(1)
 
     log.info(
-        "Processing %d student(s) with %d worker(s).",
-        len(student_ids),
+        "Processing %d active student(s) with %d worker(s).",
+        len(students),
         cfg.max_workers,
     )
 
     results_queue: Queue = Queue()
-    num_workers = min(cfg.max_workers, len(student_ids))
-    chunks = distribute(student_ids, num_workers)
+    num_workers = min(cfg.max_workers, len(students))
+    chunks = distribute(students, num_workers)
 
     threads = []
     for worker_id, chunk in enumerate(chunks):
@@ -566,7 +589,7 @@ def main():
 
     success_count = sum(1 for r in all_results if r["success"])
     log.info(
-        "Done. %d/%d students processed successfully.", success_count, len(student_ids)
+        "Done. %d/%d students processed successfully.", success_count, len(students)
     )
 
 if __name__ == "__main__":
